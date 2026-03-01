@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.idea/
+*.egg-info/
+.eggs/
+dist/
+build/
+tmp_smoke/
+results/
