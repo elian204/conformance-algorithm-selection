@@ -59,6 +59,9 @@ class RunSpec:
     skip_reason: str = ""
 
 
+QueuedRun = Tuple[RunSpec, List[str], Optional[Dict[str, str]]]
+
+
 def _load_mapping(path: Optional[Path]) -> Dict[str, str]:
     if path is None:
         return {}
@@ -214,6 +217,41 @@ def _resolve_log_for_model(
     return _find_default_log(model_path, logs_by_stem)
 
 
+def _interleave_shard_runs(run_queue: List[QueuedRun]) -> List[QueuedRun]:
+    """Round-robin shard jobs across parent models while preserving per-model shard order."""
+    if len(run_queue) <= 1:
+        return run_queue
+
+    grouped: Dict[str, List[QueuedRun]] = {}
+    group_order: List[str] = []
+    for queued_run in run_queue:
+        spec = queued_run[0]
+        parent_run_id = spec.parent_run_id
+        if parent_run_id not in grouped:
+            grouped[parent_run_id] = []
+            group_order.append(parent_run_id)
+        grouped[parent_run_id].append(queued_run)
+
+    if len(group_order) <= 1:
+        return run_queue
+
+    interleaved: List[QueuedRun] = []
+    while grouped:
+        next_group_order: List[str] = []
+        for parent_run_id in group_order:
+            group_runs = grouped.get(parent_run_id)
+            if not group_runs:
+                continue
+            interleaved.append(group_runs.pop(0))
+            if group_runs:
+                next_group_order.append(parent_run_id)
+            else:
+                grouped.pop(parent_run_id, None)
+        group_order = next_group_order
+
+    return interleaved
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Run batch dataset experiments over many models")
     p.add_argument("--models-dir", required=True, type=str)
@@ -329,7 +367,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     success_results = dict(completed_success_rows)
     failures = 0
     executed = 0
-    run_queue: List[Tuple[RunSpec, List[str], Optional[Dict[str, str]]]] = []
+    run_queue: List[QueuedRun] = []
 
     for spec in specs:
         now = datetime.utcnow().isoformat()
@@ -442,6 +480,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             continue
 
         run_queue.append((spec, cmd, worker_env))
+
+    if args.trace_shard_count > 1:
+        run_queue = _interleave_shard_runs(run_queue)
 
     def _record_run_result(
         spec: RunSpec,

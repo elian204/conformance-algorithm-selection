@@ -39,6 +39,7 @@ Author: Bidirectional A* Conformance Checking Research
 import argparse
 import json
 import pickle
+import sys
 import time
 import warnings
 from pathlib import Path
@@ -201,16 +202,44 @@ def sample_log(log: EventLog, max_traces: int = 2000, seed: int = 42) -> EventLo
     """Sample traces for faster evaluation."""
     if len(log) <= max_traces:
         return log
-    
+
     rng = random.Random(seed)
     indices = list(range(len(log)))
     rng.shuffle(indices)
     indices = sorted(indices[:max_traces])
-    
+
     sampled = EventLog()
     for i in indices:
         sampled.append(log[i])
-    
+
+    return sampled
+
+
+def sample_log_fraction(log: EventLog, fraction: float, seed: int = 42) -> EventLog:
+    """
+    Sample a fraction of traces from the log for discovery diversification.
+
+    Args:
+        log: Full event log
+        fraction: Fraction of traces to keep (0.0, 1.0)
+        seed: Random seed for reproducibility
+
+    Returns:
+        Sampled EventLog with floor(fraction * len(log)) traces
+    """
+    n_traces = max(1, int(len(log) * fraction))
+    if n_traces >= len(log):
+        return log
+
+    rng = random.Random(seed)
+    indices = list(range(len(log)))
+    rng.shuffle(indices)
+    indices = sorted(indices[:n_traces])
+
+    sampled = EventLog()
+    for i in indices:
+        sampled.append(log[i])
+
     return sampled
 
 
@@ -271,6 +300,35 @@ def get_model_structure(net, im, fm) -> Dict[str, int]:
         "arcs": len(net.arcs),
         "invisible_transitions": count_invisible_transitions(net),
     }
+
+
+def save_model_pickle(filepath: Path, net, im, fm) -> None:
+    """
+    Persist a discovered model using a recursion-safe pickle strategy.
+
+    Some PM4Py-discovered nets create deep object graphs that can exceed the
+    default Python recursion limit during pickling. Retry once with a higher
+    recursion limit before surfacing the error.
+    """
+    filepath = Path(filepath)
+    payload = {"net": net, "im": im, "fm": fm}
+    original_limit = sys.getrecursionlimit()
+    retry_limit = max(original_limit, 200_000)
+
+    try:
+        with filepath.open("wb") as f:
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        return
+    except RecursionError:
+        if retry_limit == original_limit:
+            raise
+
+    try:
+        sys.setrecursionlimit(retry_limit)
+        with filepath.open("wb") as f:
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    finally:
+        sys.setrecursionlimit(original_limit)
 
 
 # ==============================================================================
@@ -519,7 +577,8 @@ def explore_inductive_miner_space(
     output_dir: Path,
     targets: QualityTargets,
     eval_log: Optional[EventLog] = None,
-    quick_mode: bool = False
+    quick_mode: bool = False,
+    custom_noise_grid: Optional[List[float]] = None
 ) -> List[DiscoveredModel]:
     """
     Systematically explore Inductive Miner parameter space.
@@ -532,7 +591,9 @@ def explore_inductive_miner_space(
     print("─" * 70)
     
     # Define noise grid based on mode
-    if quick_mode:
+    if custom_noise_grid is not None:
+        noise_grid = custom_noise_grid
+    elif quick_mode:
         noise_grid = [0.0, 0.1, 0.2, 0.3, 0.5, 0.7]
     else:
         # Fine-grained grid for thorough exploration
@@ -575,8 +636,7 @@ def explore_inductive_miner_space(
             filename = f"{dataset_name}_f{fitness:.4f}_p{precision:.4f}_IMf_n{noise:.2f}_model.pkl"
             filepath = output_dir / filename
             
-            with open(filepath, "wb") as f:
-                pickle.dump({"net": net, "im": im, "fm": fm}, f)
+            save_model_pickle(filepath, net, im, fm)
             
             model = DiscoveredModel(
                 dataset_name=dataset_name,
@@ -597,6 +657,133 @@ def explore_inductive_miner_space(
             )
             discovered.append(model)
     
+    return discovered
+
+
+def explore_inductive_miner_sampled(
+    log: EventLog,
+    dataset_name: str,
+    output_dir: Path,
+    targets: QualityTargets,
+    sample_fractions: List[float] = None,
+    sample_seeds: List[int] = None,
+    quick_mode: bool = False,
+    custom_noise_grid: Optional[List[float]] = None
+) -> List[DiscoveredModel]:
+    """
+    Discover IM models on sampled fractions of the log, evaluate on full log.
+
+    This diversification strategy produces structurally different nets by
+    discovering on partial logs.  Models that only saw a subset of behavior
+    tend to be tighter (higher precision, lower fitness on the full log),
+    expanding the reachable fitness-precision frontier.
+
+    Args:
+        log: Full event log (used for evaluation)
+        dataset_name: Name for output files
+        output_dir: Directory for saving models
+        targets: Quality targets
+        sample_fractions: Fractions of traces to sample for discovery
+        sample_seeds: Random seeds per fraction (multiple seeds = multiple samples)
+        quick_mode: Use coarse noise grid
+    """
+    if sample_fractions is None:
+        sample_fractions = [0.6, 0.8, 0.9]
+    if sample_seeds is None:
+        sample_seeds = [42, 123, 7]
+
+    print("\n" + "─" * 70)
+    print("INDUCTIVE MINER (IMf) - Sampled Discovery (evaluate on full log)")
+    print("─" * 70)
+    print(f"  Fractions: {sample_fractions}")
+    print(f"  Seeds per fraction: {sample_seeds}")
+    print(f"  Full log: {len(log)} traces")
+
+    if custom_noise_grid is not None:
+        noise_grid = custom_noise_grid
+    elif quick_mode:
+        noise_grid = [0.0, 0.1, 0.2, 0.3, 0.5, 0.7]
+    else:
+        noise_grid = [
+            0.00, 0.02, 0.05, 0.08, 0.10, 0.12, 0.15, 0.18,
+            0.20, 0.25, 0.30, 0.35, 0.40, 0.50, 0.60, 0.70, 0.80
+        ]
+
+    discovered = []
+    seen_structures = set()  # Global dedup across all fractions/seeds
+
+    for frac in sample_fractions:
+        for seed in sample_seeds:
+            sampled = sample_log_fraction(log, frac, seed)
+            print(f"\n  --- fraction={frac}, seed={seed} ({len(sampled)} traces) ---")
+
+            for noise in noise_grid:
+                # Discover on sampled log
+                params = {"noise_threshold": noise, "variant": "IMf"}
+                start_time = time.time()
+                try:
+                    net, im, fm = pm4py.discover_petri_net_inductive(
+                        sampled, noise_threshold=noise
+                    )
+                    disc_time = time.time() - start_time
+                except Exception as e:
+                    print(f"    noise={noise:.2f} frac={frac} seed={seed}: discovery failed: {e}")
+                    continue
+
+                structure = get_model_structure(net, im, fm)
+                struct_key = (structure["places"], structure["transitions"], structure["arcs"])
+
+                if struct_key in seen_structures:
+                    continue
+                seen_structures.add(struct_key)
+
+                # Evaluate on FULL log
+                eval_start = time.time()
+                fitness, precision = evaluate_model(log, net, im, fm)
+                eval_time = time.time() - eval_start
+
+                meets_fitness = fitness >= targets.min_fitness
+                meets_precision = precision >= targets.min_precision
+                score = targets.quality_score(fitness, precision)
+
+                status = "!!" if meets_fitness and meets_precision else ("!" if meets_fitness else "x")
+                print(f"    noise={noise:.2f} -> f={fitness:.4f} p={precision:.4f} "
+                      f"[{structure['places']}P, {structure['transitions']}T, "
+                      f"{structure['invisible_transitions']}t] {status}")
+
+                if meets_fitness:
+                    filename = (f"{dataset_name}_f{fitness:.4f}_p{precision:.4f}"
+                                f"_IMf_n{noise:.2f}_s{frac:.1f}_sd{seed}_model.pkl")
+                    filepath = output_dir / filename
+                    save_model_pickle(filepath, net, im, fm)
+
+                    # Enrich params with sampling info
+                    params_full = {
+                        **params,
+                        "sample_fraction": frac,
+                        "sample_seed": seed,
+                        "sample_traces": len(sampled),
+                    }
+
+                    model = DiscoveredModel(
+                        dataset_name=dataset_name,
+                        discovery_method="InductiveMiner_IMf_sampled",
+                        parameters=params_full,
+                        places=structure["places"],
+                        transitions=structure["transitions"],
+                        arcs=structure["arcs"],
+                        invisible_transitions=structure["invisible_transitions"],
+                        fitness=fitness,
+                        precision=precision,
+                        discovery_time=disc_time,
+                        evaluation_time=eval_time,
+                        filename=filename,
+                        meets_min_fitness=meets_fitness,
+                        meets_min_precision=meets_precision,
+                        quality_score=score
+                    )
+                    discovered.append(model)
+
     return discovered
 
 
@@ -660,8 +847,7 @@ def explore_split_miner_space(
             filename = f"{dataset_name}_f{fitness:.4f}_p{precision:.4f}_SM_p{par_thresh:.2f}_f{freq_thresh:.2f}_model.pkl"
             filepath = output_dir / filename
             
-            with open(filepath, "wb") as f:
-                pickle.dump({"net": net, "im": im, "fm": fm}, f)
+            save_model_pickle(filepath, net, im, fm)
             
             model = DiscoveredModel(
                 dataset_name=dataset_name,
@@ -731,8 +917,7 @@ def explore_ilp_miner_space(
             filename = f"{dataset_name}_f{fitness:.4f}_p{precision:.4f}_ILP_a{alpha:.2f}_model.pkl"
             filepath = output_dir / filename
             
-            with open(filepath, "wb") as f:
-                pickle.dump({"net": net, "im": im, "fm": fm}, f)
+            save_model_pickle(filepath, net, im, fm)
             
             model = DiscoveredModel(
                 dataset_name=dataset_name,
@@ -804,8 +989,7 @@ def explore_heuristic_miner_space(
             filename = f"{dataset_name}_f{fitness:.4f}_p{precision:.4f}_HM_d{dep_thresh:.2f}_model.pkl"
             filepath = output_dir / filename
             
-            with open(filepath, "wb") as f:
-                pickle.dump({"net": net, "im": im, "fm": fm}, f)
+            save_model_pickle(filepath, net, im, fm)
             
             model = DiscoveredModel(
                 dataset_name=dataset_name,
@@ -840,11 +1024,14 @@ def explore_quality_model_space(
     targets: QualityTargets,
     max_eval_traces: Optional[int] = None,
     quick_mode: bool = False,
-    algorithms: Optional[List[str]] = None
+    algorithms: Optional[List[str]] = None,
+    sample_fractions: Optional[List[float]] = None,
+    sample_seeds: Optional[List[int]] = None,
+    noise_grid: Optional[List[float]] = None
 ) -> List[DiscoveredModel]:
     """
     Explore the fitness-precision space to discover quality models.
-    
+
     Args:
         log: Event log
         dataset_name: Name for output files
@@ -853,7 +1040,9 @@ def explore_quality_model_space(
         max_eval_traces: Maximum traces for evaluation (None = full log)
         quick_mode: Use coarse parameter grids for faster exploration
         algorithms: List of algorithms to use (default: all)
-        
+        sample_fractions: If provided, also run sampled discovery at these fractions
+        sample_seeds: Seeds for sampled discovery (default: [42, 123, 7])
+
     Returns:
         List of discovered models meeting quality requirements
     """
@@ -862,7 +1051,7 @@ def explore_quality_model_space(
     print("=" * 70)
     print(f"Targets: fitness ≥ {targets.min_fitness:.2f}, precision ≥ {targets.min_precision:.2f}")
     print(f"Mode: {'Quick' if quick_mode else 'Thorough'}")
-    
+
     # Prepare evaluation log
     if max_eval_traces is not None:
         eval_log = sample_log(log, max_traces=max_eval_traces)
@@ -870,45 +1059,58 @@ def explore_quality_model_space(
     else:
         eval_log = log
         print(f"Evaluation: full log ({len(log)} traces)")
-    
+
     # Default algorithms
     if algorithms is None:
         algorithms = ["IM", "SM", "ILP", "HM"]
-    
+
     all_discovered = []
-    
-    # Inductive Miner
+
+    # Inductive Miner (full log)
     if "IM" in algorithms:
         models = explore_inductive_miner_space(
-            log, dataset_name, output_dir, targets, eval_log, quick_mode
+            log, dataset_name, output_dir, targets, eval_log, quick_mode,
+            custom_noise_grid=noise_grid
         )
         all_discovered.extend(models)
-        print(f"  → {len(models)} models meeting criteria")
-    
+        print(f"  -> {len(models)} models meeting criteria")
+
+    # Inductive Miner (sampled discovery)
+    if "IM" in algorithms and sample_fractions:
+        models = explore_inductive_miner_sampled(
+            log, dataset_name, output_dir, targets,
+            sample_fractions=sample_fractions,
+            sample_seeds=sample_seeds,
+            quick_mode=quick_mode,
+            custom_noise_grid=noise_grid
+        )
+        all_discovered.extend(models)
+        print(f"  -> {len(models)} sampled-discovery models meeting criteria")
+
     # Split Miner
     if "SM" in algorithms:
         models = explore_split_miner_space(
             log, dataset_name, output_dir, targets, eval_log, quick_mode
         )
         all_discovered.extend(models)
-        print(f"  → {len(models)} models meeting criteria")
-    
+        print(f"  -> {len(models)} models meeting criteria")
+
     # ILP Miner
     if "ILP" in algorithms:
         models = explore_ilp_miner_space(
             log, dataset_name, output_dir, targets, eval_log, quick_mode
         )
         all_discovered.extend(models)
-        print(f"  → {len(models)} models meeting criteria")
-    
+        print(f"  -> {len(models)} models meeting criteria")
+
     # Heuristic Miner
     if "HM" in algorithms:
         models = explore_heuristic_miner_space(
             log, dataset_name, output_dir, targets, eval_log, quick_mode
         )
         all_discovered.extend(models)
-        print(f"  → {len(models)} models meeting criteria")
-    
+        print(f"  -> {len(models)} models meeting criteria")
+
     return all_discovered
 
 
@@ -1065,7 +1267,31 @@ Examples:
         default=None,
         help="Discovery algorithms to use (default: all)"
     )
-    
+
+    parser.add_argument(
+        "--sample-fractions",
+        nargs="+",
+        type=float,
+        default=None,
+        help="Fractions of log to sample for discovery diversification (e.g., 0.6 0.8 0.9)"
+    )
+
+    parser.add_argument(
+        "--sample-seeds",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Random seeds for sampled discovery (default: 42 123 7)"
+    )
+
+    parser.add_argument(
+        "--noise-grid",
+        nargs="+",
+        type=float,
+        default=None,
+        help="Custom noise thresholds to use (e.g., 0.0 0.1 0.2 0.4 0.6 0.8)"
+    )
+
     args = parser.parse_args()
     
     # Validate input
@@ -1093,6 +1319,8 @@ Examples:
     print(f"Dataset:   {log_path}")
     print(f"Output:    {output_dir}")
     print(f"Targets:   fitness ≥ {targets.min_fitness:.2f}, precision ≥ {targets.min_precision:.2f}")
+    if args.sample_fractions:
+        print(f"Sampling:  fractions={args.sample_fractions}, seeds={args.sample_seeds or [42, 123, 7]}")
     print("=" * 70)
     
     # Load log
@@ -1113,7 +1341,10 @@ Examples:
         targets=targets,
         max_eval_traces=args.max_eval_traces,
         quick_mode=args.quick,
-        algorithms=args.algorithms
+        algorithms=args.algorithms,
+        sample_fractions=args.sample_fractions,
+        sample_seeds=args.sample_seeds,
+        noise_grid=args.noise_grid
     )
     
     # Analysis

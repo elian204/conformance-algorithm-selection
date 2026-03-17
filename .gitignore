@@ -8,3 +8,16 @@ dist/
 build/
 tmp_smoke/
 results/
+
+# Large data files
+data/*.xes
+data/*.xes.pkl
+data/*.pkl
+data/*.bak_*
+data/*.txt
+
+# Discovery model artifacts (large)
+discovery/models/
+
+# Experiment results (large)
+experiments/results_*/

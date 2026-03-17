@@ -29,7 +29,7 @@ from enum import Enum, auto
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
 from core.petri_net import (
-    PetriNet, WorkflowNet, Place, Transition, Marking, marking_from_places
+    PetriNet, WorkflowNet, Place, Transition, Marking, merge_markings
 )
 
 # -----------------------------------------------------------------------------
@@ -103,8 +103,8 @@ class SynchronousProduct:
         self.tn = tn
 
         # Initial and final markings of SP
-        self.initial_marking: Marking = frozenset(sn.initial_marking | tn.initial_marking)
-        self.final_marking:   Marking = frozenset(sn.final_marking   | tn.final_marking)
+        self.initial_marking: Marking = merge_markings(sn.initial_marking, tn.initial_marking)
+        self.final_marking:   Marking = merge_markings(sn.final_marking, tn.final_marking)
 
         # Pre-compute SP transitions (static set — same transitions are always available,
         # only enabledness depends on the current marking)
@@ -210,24 +210,47 @@ class SynchronousProduct:
 
     def is_enabled(self, marking: Marking, sp_t: SPTransition) -> bool:
         """Check if transition is enabled (uses cached preset)."""
-        return self._cached_preset[sp_t].issubset(marking)
+        return all(marking.count(place) >= 1 for place in self._cached_preset[sp_t])
 
     def fire(self, marking: Marking, sp_t: SPTransition) -> Marking:
         """Fire transition and return new marking (uses cached pre/postsets)."""
         preset = self._cached_preset[sp_t]
         postset = self._cached_postset[sp_t]
-        new = (set(marking) - preset) | postset
-        return frozenset(new)
+        counts = marking.as_dict()
+
+        for place in preset:
+            available = counts.get(place, 0)
+            if available <= 0:
+                raise ValueError(f"Transition {sp_t.name} is not enabled at {marking}")
+            if available == 1:
+                counts.pop(place)
+            else:
+                counts[place] = available - 1
+
+        for place in postset:
+            counts[place] = counts.get(place, 0) + 1
+
+        return Marking(counts.items())
 
     def successors(self, marking: Marking) -> List[Tuple[SPTransition, Marking, float]]:
         """Return list of (sp_transition, successor_marking, cost). OPTIMIZED."""
         result = []
         for sp_t in self._sp_transitions:
             preset = self._cached_preset[sp_t]
-            if preset.issubset(marking):
-                # Compute successor directly without extra function calls
+            if all(marking.count(place) >= 1 for place in preset):
+                counts = marking.as_dict()
+                for place in preset:
+                    available = counts[place]
+                    if available == 1:
+                        counts.pop(place)
+                    else:
+                        counts[place] = available - 1
+
                 postset = self._cached_postset[sp_t]
-                succ = (marking - preset) | postset
+                for place in postset:
+                    counts[place] = counts.get(place, 0) + 1
+
+                succ = Marking(counts.items())
                 result.append((sp_t, succ, sp_t.cost))
         return result
 
@@ -236,20 +259,47 @@ class SynchronousProduct:
         Return list of (sp_transition, predecessor_marking, cost) for the
         reversed graph RG(SP)^rev. OPTIMIZED.
 
-        For each SP transition t with preset •t and postset t•:
-        - A predecessor exists if t• ⊆ marking (postset is "consumable")
-        - The predecessor marking is: (marking - t•) ∪ •t
-        - Firing t from predecessor produces marking
+        For each SP transition t with preset •t and postset t•, we need all
+        predecessor markings `pred` such that:
+
+            fire(pred, t) == marking
+
+        Under multiset semantics with unit arc weights, the predecessor is
+        unique whenever it exists. For each place p:
+
+            marking(p) = pred(p) - 1[p in •t] + 1[p in t•]
+
+        Therefore:
+
+            pred(p) = marking(p) + 1[p in •t] - 1[p in t•]
+
+        and a valid predecessor exists iff every resulting count is
+        non-negative.
         """
         result = []
         for sp_t in self._sp_transitions:
             preset = self._cached_preset[sp_t]
             postset = self._cached_postset[sp_t]
-            # Reconstruct predecessor: pred = (marking - postset) ∪ preset
-            # Valid only if postset ⊆ marking (otherwise this reverse edge doesn't exist here)
-            if not postset.issubset(marking):
+            counts = marking.as_dict()
+            valid = True
+
+            for place in postset:
+                available = counts.get(place, 0)
+                if available <= 0:
+                    valid = False
+                    break
+                if available == 1:
+                    counts.pop(place)
+                else:
+                    counts[place] = available - 1
+
+            if not valid:
                 continue
-            pred = frozenset((set(marking) - postset) | preset)
-            # Note: preset.issubset(pred) is always true by construction
-            result.append((sp_t, pred, sp_t.cost))
+
+            for place in preset:
+                counts[place] = counts.get(place, 0) + 1
+
+            pred = Marking(counts.items())
+            if self.fire(pred, sp_t) == marking:
+                result.append((sp_t, pred, sp_t.cost))
         return result

@@ -5,6 +5,7 @@ scipy>=1.10.0        # fallback LP solver (when Gurobi unavailable)
 
 # Process mining
 pm4py>=2.7.0         # XES/PNML I/O and Petri net representations
+graphviz>=0.20.0     # Petri net PDF rendering
 
 # Optimization (Gurobi)
 # Install separately — requires license:

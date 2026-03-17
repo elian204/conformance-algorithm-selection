@@ -10,7 +10,11 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from scripts.run_batch_experiments import _build_run_id, main as batch_main
+from scripts.run_batch_experiments import (
+    _build_run_id,
+    _interleave_shard_runs,
+    main as batch_main,
+)
 
 
 
@@ -241,3 +245,85 @@ def test_batch_shard_workers_set_single_thread_env(tmp_path: Path):
         assert env["OPENBLAS_NUM_THREADS"] == "1"
         assert env["MKL_NUM_THREADS"] == "1"
         assert env["NUMEXPR_NUM_THREADS"] == "1"
+
+
+def test_interleave_shard_runs_round_robin_across_models(tmp_path: Path):
+    model_a = tmp_path / "a.pkl"
+    model_b = tmp_path / "b.pkl"
+    log_a = tmp_path / "a.xes"
+    log_b = tmp_path / "b.xes"
+    for path in (model_a, model_b, log_a, log_b):
+        path.write_text("x", encoding="utf-8")
+
+    queue = []
+    for parent_run_id, model_path, log_path in (
+        ("parent_a", model_a, log_a),
+        ("parent_b", model_b, log_b),
+    ):
+        for shard_index in range(2):
+            spec = type("Spec", (), {
+                "parent_run_id": parent_run_id,
+                "trace_shard_index": shard_index,
+            })()
+            queue.append((spec, ["--model", str(model_path), "--log", str(log_path)], None))
+
+    ordered = _interleave_shard_runs(queue)
+    actual = [(item[0].parent_run_id, item[0].trace_shard_index) for item in ordered]
+    assert actual == [
+        ("parent_a", 0),
+        ("parent_b", 0),
+        ("parent_a", 1),
+        ("parent_b", 1),
+    ]
+
+
+def test_batch_shards_execute_round_robin_across_models(tmp_path: Path):
+    models_dir = tmp_path / "models"
+    logs_dir = tmp_path / "logs"
+    out_dir = tmp_path / "out"
+    models_dir.mkdir()
+    logs_dir.mkdir()
+
+    (models_dir / "A_model.pkl").write_text("x", encoding="utf-8")
+    (models_dir / "B_model.pkl").write_text("x", encoding="utf-8")
+    (logs_dir / "A.xes").write_text("x", encoding="utf-8")
+    (logs_dir / "B.xes").write_text("x", encoding="utf-8")
+
+    execution_order = []
+
+    def fake_execute(cmd, repo_root, env=None):
+        model_path = Path(cmd[cmd.index("--model") + 1]).name
+        shard_index = int(cmd[cmd.index("--trace-shard-index") + 1])
+        execution_order.append((model_path, shard_index))
+        results_dir = out_dir / "fake_results" / f"{model_path}_s{shard_index:02d}"
+        results_dir.mkdir(parents=True, exist_ok=True)
+        (results_dir / "results.csv").write_text(
+            "model_id,trace_hash,method\n"
+            f"{model_path},trace_{shard_index},forward_zero\n",
+            encoding="utf-8",
+        )
+        return {
+            "return_code": 0,
+            "elapsed_seconds": 0.0,
+            "stdout": "",
+            "stderr": "",
+            "results_dir": str(results_dir),
+        }
+
+    with patch("scripts.run_batch_experiments._execute_run_command", side_effect=fake_execute):
+        rc = batch_main([
+            "--models-dir", str(models_dir),
+            "--logs-dir", str(logs_dir),
+            "--output-dir", str(out_dir),
+            "--trace-shard-count", "2",
+            "--jobs", "1",
+            "--no-quality",
+        ])
+
+    assert rc == 0
+    assert execution_order == [
+        ("A_model.pkl", 0),
+        ("B_model.pkl", 0),
+        ("A_model.pkl", 1),
+        ("B_model.pkl", 1),
+    ]

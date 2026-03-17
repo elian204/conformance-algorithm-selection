@@ -98,6 +98,10 @@ def astar_forward(
     while open_heap:
         f_val, g_val, _, m, h_known = heapq.heappop(open_heap)
 
+        # Skip stale heap entries that were superseded before expansion.
+        if g_val > g.get(m, float('inf')) + 1e-12:
+            continue
+
         # Skip if already expanded with same or better g
         if m in closed:
             if g_val >= closed[m]:

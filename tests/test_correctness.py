@@ -24,6 +24,7 @@ from core.trace_model import build_trace_net
 from core.synchronous_product import SynchronousProduct, TAU_EPSILON
 from heuristics.zero import ZeroHeuristic
 from heuristics.marking_equation import MarkingEquationHeuristicScipy
+from heuristics.reach import REACHHeuristic
 from algorithms.astar_forward import astar_forward
 from algorithms.astar_backward import astar_backward
 from algorithms.astar_bidirectional import astar_bidirectional
@@ -304,6 +305,52 @@ def test_sync_move_has_zero_cost():
     for sync_t in sync_transitions:
         assert sync_t.cost == 0.0, \
             f"Synchronous move {sync_t.name} should have cost=0, got {sync_t.cost}"
+
+
+def test_mmr_handles_multiset_markings():
+    """MMR should respect repeated tokens in the same place."""
+    from core.petri_net import PetriNet, WorkflowNet, marking_from_places
+
+    net = PetriNet("multiset_mmr")
+    p0 = net.add_place("p0")
+    p1 = net.add_place("p1")
+    p2 = net.add_place("p2")
+    q = net.add_place("q")
+    pf = net.add_place("pf")
+
+    t_split = net.add_transition("t_split", None)
+    t_to_q_1 = net.add_transition("t_to_q_1", None)
+    t_to_q_2 = net.add_transition("t_to_q_2", None)
+    t_a = net.add_transition("t_a", "A")
+
+    net.add_arc_place_to_transition(p0, t_split)
+    net.add_arc_transition_to_place(t_split, p1)
+    net.add_arc_transition_to_place(t_split, p2)
+
+    net.add_arc_place_to_transition(p1, t_to_q_1)
+    net.add_arc_transition_to_place(t_to_q_1, q)
+
+    net.add_arc_place_to_transition(p2, t_to_q_2)
+    net.add_arc_transition_to_place(t_to_q_2, q)
+
+    net.add_arc_place_to_transition(q, t_a)
+    net.add_arc_transition_to_place(t_a, pf)
+
+    wf = WorkflowNet(
+        net=net,
+        initial_marking=marking_from_places(p0),
+        final_marking=marking_from_places(pf, pf),
+    )
+    tn = build_trace_net(["A"])
+    sp = SynchronousProduct(wf, tn)
+
+    h_mmr = REACHHeuristic(sp, "forward")
+    h_me = MarkingEquationHeuristicScipy(sp, "forward")
+
+    assert h_mmr.estimate(sp.initial_marking) == 1.0
+    assert round(astar_forward(sp, ZeroHeuristic(sp, "forward")).optimal_cost) == 1
+    assert round(astar_forward(sp, h_mmr).optimal_cost) == 1
+    assert round(astar_forward(sp, h_me).optimal_cost) == 1
 
 
 if __name__ == "__main__":

@@ -19,10 +19,10 @@ double-counting in AND-join structures.
 OPTIMIZATION (2025): Added early termination when already at goal marking.
 """
 from __future__ import annotations
-from typing import Dict, List, Set, Optional, Tuple, FrozenSet
+from typing import Dict, List, Set
 
 from core.petri_net import Marking, Place, Transition
-from core.synchronous_product import SynchronousProduct, SPTransition, MoveType
+from core.synchronous_product import SynchronousProduct
 from heuristics.base import Heuristic
 
 
@@ -57,8 +57,8 @@ class REACHHeuristic(Heuristic):
 
         # Identify SN places
         self._sn_places: Set[Place] = set(self.sp.sn.places)
-        self._sn_final: FrozenSet[Place] = frozenset(self.sp.sn.final_marking)
-        self._sn_initial: FrozenSet[Place] = frozenset(self.sp.sn.initial_marking)
+        self._sn_final: Marking = self.sp.sn.final_marking
+        self._sn_initial: Marking = self.sp.sn.initial_marking
 
         # For each place, find output transitions: p•
         self._place_outputs: Dict[Place, Set[Transition]] = {}
@@ -157,9 +157,13 @@ class REACHHeuristic(Heuristic):
 
         self._trace_length = len(self._trace_activities)
 
-    def _project_to_sn(self, marking: Marking) -> FrozenSet[Place]:
-        """Project SP marking onto SN places only."""
-        return frozenset(p for p in marking if p in self._sn_places)
+    def _project_to_sn(self, marking: Marking) -> Marking:
+        """Project SP marking onto SN places only, preserving multiplicities."""
+        return Marking(
+            (place, count)
+            for place, count in marking.items()
+            if place in self._sn_places
+        )
 
     def _get_remaining_trace(self, marking: Marking) -> List[str]:
         """
@@ -177,7 +181,38 @@ class REACHHeuristic(Heuristic):
         # Return remaining activities from this position
         return self._trace_activities[position:]
 
-    def _compute_mmr_forward(self, sn_marking: FrozenSet[Place],
+    def _is_enabled(self, marking: Marking, transition: Transition) -> bool:
+        return all(marking.count(place) >= 1 for place in self._trans_preset[transition])
+
+    def _needs_progress(self, current: Marking, target: Marking, place: Place) -> bool:
+        return current.count(place) > target.count(place)
+
+    def _find_forced_transitions(self, current_marking: Marking, target_marking: Marking) -> List[Transition]:
+        seen: Set[Transition] = set()
+        forced: List[Transition] = []
+
+        for place in current_marking:
+            if place not in self._forced_places:
+                continue
+            if not self._needs_progress(current_marking, target_marking, place):
+                continue
+
+            transition = next(iter(self._place_outputs[place]))
+            if transition in seen:
+                continue
+            if self._is_enabled(current_marking, transition):
+                forced.append(transition)
+                seen.add(transition)
+
+        return forced
+
+    def _iteration_budget(self, current_marking: Marking, target_marking: Marking) -> int:
+        return max(
+            len(self._sn_places) * 10,
+            len(self._sn_places) * (current_marking.total_tokens + target_marking.total_tokens + 1),
+        )
+
+    def _compute_mmr_forward(self, sn_marking: Marking,
                              remaining_trace: List[str]) -> int:
         """
         Compute MMR for forward search: minimum model moves from sn_marking to final.
@@ -202,50 +237,38 @@ class REACHHeuristic(Heuristic):
         available_trace = list(remaining_trace)
 
         # BFS to find all forced transitions
-        current_marking = set(sn_marking)
-        visited_markings = {frozenset(current_marking)}
+        current_marking = sn_marking
+        visited_markings = {current_marking}
 
-        # Limit iterations to avoid infinite loops
-        max_iterations = len(self._sn_places) * 10
+        # Limit iterations to avoid infinite loops while still allowing
+        # repeated firings when a place carries multiple tokens.
+        max_iterations = self._iteration_budget(current_marking, self._sn_final)
 
         for _ in range(max_iterations):
-            # Find forced transitions from current marking
-            # BUG FIX: Use SET to avoid duplicates (critical for AND-joins where
-            # multiple places may force the same transition)
-            forced_transitions = set()
-
-            for p in list(current_marking):
-                if p in self._forced_places and p not in self._sn_final:
-                    # This place has exactly one output - that transition must fire
-                    forced_trans = next(iter(self._place_outputs[p]))
-
-                    # Check if transition is enabled
-                    if self._trans_preset[forced_trans].issubset(current_marking):
-                        forced_transitions.add(forced_trans)
+            forced_transitions = self._find_forced_transitions(current_marking, self._sn_final)
 
             if not forced_transitions:
                 break
 
-            # Process forced transitions (each transition exactly once)
+            fired_any = False
             for t in forced_transitions:
+                if not self._is_enabled(current_marking, t):
+                    continue
+                fired_any = True
                 if t.label is not None:
-                    # Labeled transition
                     if t.label in available_trace:
-                        # Can synchronize with trace - no extra cost
                         available_trace.remove(t.label)
                     else:
-                        # Must do model move
                         required_model_moves += 1
 
-                # Fire the transition
-                current_marking -= self._trans_preset[t]
-                current_marking |= self._trans_postset[t]
+                current_marking = self._sn_net.fire(current_marking, t)
 
-            # Check if we've seen this marking before
-            frozen_current = frozenset(current_marking)
-            if frozen_current in visited_markings:
+            if not fired_any:
                 break
-            visited_markings.add(frozen_current)
+
+            if current_marking in visited_markings:
+                break
+            visited_markings.add(current_marking)
 
         # Also count trace activities that cannot be matched by any model transition
         for act in available_trace:
@@ -255,7 +278,7 @@ class REACHHeuristic(Heuristic):
 
         return required_model_moves
 
-    def _compute_mmr_backward(self, sn_marking: FrozenSet[Place],
+    def _compute_mmr_backward(self, sn_marking: Marking,
                               consumed_trace: List[str]) -> int:
         """
         Compute MMR for backward search: minimum model moves from initial to sn_marking.
@@ -277,42 +300,40 @@ class REACHHeuristic(Heuristic):
         available_trace = list(consumed_trace)
 
         # Walk forward from initial to see required transitions
-        current_marking = set(self._sn_initial)
-        visited_markings = {frozenset(current_marking)}
+        current_marking = self._sn_initial
+        visited_markings = {current_marking}
         target = sn_marking
 
-        max_iterations = len(self._sn_places) * 10
+        max_iterations = self._iteration_budget(current_marking, target)
 
         for _ in range(max_iterations):
-            if frozenset(current_marking) == target:
+            if current_marking == target:
                 break
 
-            # BUG FIX: Use SET to avoid duplicates (critical for AND-joins)
-            forced_transitions = set()
-
-            for p in list(current_marking):
-                if p in self._forced_places and p not in target:
-                    forced_trans = next(iter(self._place_outputs[p]))
-                    if self._trans_preset[forced_trans].issubset(current_marking):
-                        forced_transitions.add(forced_trans)
+            forced_transitions = self._find_forced_transitions(current_marking, target)
 
             if not forced_transitions:
                 break
 
+            fired_any = False
             for t in forced_transitions:
+                if not self._is_enabled(current_marking, t):
+                    continue
+                fired_any = True
                 if t.label is not None:
                     if t.label in available_trace:
                         available_trace.remove(t.label)
                     else:
                         required_model_moves += 1
 
-                current_marking -= self._trans_preset[t]
-                current_marking |= self._trans_postset[t]
+                current_marking = self._sn_net.fire(current_marking, t)
 
-            frozen_current = frozenset(current_marking)
-            if frozen_current in visited_markings:
+            if not fired_any:
                 break
-            visited_markings.add(frozen_current)
+
+            if current_marking in visited_markings:
+                break
+            visited_markings.add(current_marking)
 
         return required_model_moves
 

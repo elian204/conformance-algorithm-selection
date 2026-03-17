@@ -80,6 +80,9 @@ def astar_backward(
     while open_heap:
         f_val, g_val, _, m, h_known = heapq.heappop(open_heap)
 
+        if g_val > g.get(m, float('inf')) + 1e-12:
+            continue
+
         if m in closed:
             if g_val >= closed[m]:
                 continue

@@ -20,7 +20,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from core.petri_net import PetriNet, WorkflowNet, Place, marking_from_places
+from core.petri_net import PetriNet, WorkflowNet, Place, marking_from_dict, marking_from_places
 from core.trace_model import build_trace_net  # noqa: imported for convenience
 
 # ---------------------------------------------------------------------------
@@ -58,8 +58,8 @@ def convert_pm4py_net(pm_net, pm_initial, pm_final) -> WorkflowNet:
         else:  # Place -> Transition
             net.add_arc_place_to_transition(place_map[src], trans_map[tgt])
 
-    init_m = marking_from_places(*[place_map[p] for p in pm_initial])
-    final_m = marking_from_places(*[place_map[p] for p in pm_final])
+    init_m = marking_from_dict({place_map[p]: count for p, count in pm_initial.items()})
+    final_m = marking_from_dict({place_map[p]: count for p, count in pm_final.items()})
     return WorkflowNet(net=net, initial_marking=init_m, final_marking=final_m)
 
 

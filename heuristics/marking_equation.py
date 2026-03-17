@@ -164,9 +164,9 @@ class MarkingEquationHeuristic(Heuristic):
 
     def _marking_to_vector(self, marking: Marking) -> np.ndarray:
         v = np.zeros(len(self._places), dtype=np.float64)
-        for p in marking:
+        for p, count in marking.items():
             if p in self._place_idx:
-                v[self._place_idx[p]] += 1.0
+                v[self._place_idx[p]] += float(count)
         return v
 
     def estimate(self, marking: Marking) -> float:
@@ -276,9 +276,9 @@ class MarkingEquationHeuristicScipy(Heuristic):
 
     def _marking_to_vector(self, marking: Marking) -> np.ndarray:
         v = np.zeros(len(self._places), dtype=np.float64)
-        for p in marking:
+        for p, count in marking.items():
             if p in self._place_idx:
-                v[self._place_idx[p]] += 1.0
+                v[self._place_idx[p]] += float(count)
         return v
 
     def estimate(self, marking: Marking) -> float:
